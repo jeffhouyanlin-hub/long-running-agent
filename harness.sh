@@ -279,6 +279,15 @@ while [[ $SESSION -le $MAX_SESSIONS ]]; do
 
     SESSION_START=$(date +%s)
 
+    # First session gets extended timeout (5 hours) for initial setup/compilation
+    if [[ "$SESSION" -eq 1 ]]; then
+        export SESSION_TIMEOUT=18000  # 5 hours
+        export IDLE_TIMEOUT=18000     # 5 hours
+        log_info "Session 1: extended timeout (5h)"
+    else
+        unset SESSION_TIMEOUT IDLE_TIMEOUT  # fall back to defaults in utils.sh
+    fi
+
     session_exit=0
     run_claude_session "$CODING_PROMPT_FILE" "$PROJECT_DIR" "$MODEL" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || session_exit=$?
     rm -f "$CODING_PROMPT_FILE"
