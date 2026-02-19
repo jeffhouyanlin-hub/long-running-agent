@@ -118,8 +118,8 @@ run_claude_session() {
     cd "$project_dir"
 
     # --- Timeout Configuration ---
-    local SESSION_TIMEOUT="${SESSION_TIMEOUT:-1800}"  # 30 min max wall-clock time
-    local IDLE_TIMEOUT="${IDLE_TIMEOUT:-600}"          # 10 min max with no output
+    local SESSION_TIMEOUT="${SESSION_TIMEOUT:-3600}"  # 60 min max wall-clock time
+    local IDLE_TIMEOUT="${IDLE_TIMEOUT:-1800}"          # 30 min max with no output (Gradle builds need time)
 
     # Activity tracking for idle watchdog
     local activity_file
@@ -183,29 +183,64 @@ run_claude_session() {
     ) &
     local watchdog_pid=$!
 
+    # --- Real-time session log for monitor ---
+    local session_log="$project_dir/.harness-live.jsonl"
+    : > "$session_log"  # truncate
+
     # --- Parse stream-json output (Solution A) ---
     local exit_code=0
     while IFS= read -r line; do
         touch "$activity_file"  # record activity for watchdog
         local msg_type
         msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null || true)
+
+        # Write every event to live log for monitor consumption
+        local ts
+        ts=$(date '+%H:%M:%S')
+
         case "$msg_type" in
             assistant)
-                local text
+                local text tool_names input_tokens output_tokens
                 text=$(echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text' 2>/dev/null || true)
+                tool_names=$(echo "$line" | jq -r '[.message.content[]? | select(.type == "tool_use") | .name] | join(",")' 2>/dev/null || true)
+                input_tokens=$(echo "$line" | jq -r '.message.usage.input_tokens // 0' 2>/dev/null || echo 0)
+                output_tokens=$(echo "$line" | jq -r '.message.usage.output_tokens // 0' 2>/dev/null || echo 0)
+
+                # Write structured event to live log
+                printf '{"ts":"%s","type":"assistant","input_tokens":%s,"output_tokens":%s,"tools":"%s","text":"%s"}\n' \
+                    "$ts" "$input_tokens" "$output_tokens" "$tool_names" \
+                    "$(echo "${text:0:150}" | sed 's/"/\\"/g' | tr '\n' ' ')" \
+                    >> "$session_log"
+
                 if [[ -n "$text" ]]; then
                     echo -e "${BLUE}[Claude]${NC} ${text:0:200}"
                 fi
+                if [[ -n "$tool_names" ]]; then
+                    echo -e "${YELLOW}[Tool]${NC} $tool_names"
+                fi
                 ;;
             result)
-                local is_error
+                local is_error result_input result_output
                 is_error=$(echo "$line" | jq -r '.is_error // false' 2>/dev/null || echo false)
+                result_input=$(echo "$line" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
+                result_output=$(echo "$line" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+
+                printf '{"ts":"%s","type":"result","is_error":%s,"input_tokens":%s,"output_tokens":%s}\n' \
+                    "$ts" "$is_error" "$result_input" "$result_output" \
+                    >> "$session_log"
+
                 if [[ "$is_error" == "true" ]]; then
                     log_error "Session ended with error"
                 else
                     log_info "Session completed successfully."
                 fi
                 break  # ← Exit immediately after receiving result
+                ;;
+            *)
+                # Log other event types (system, etc.)
+                if [[ -n "$msg_type" ]]; then
+                    printf '{"ts":"%s","type":"%s"}\n' "$ts" "$msg_type" >> "$session_log"
+                fi
                 ;;
         esac
     done < "$fifo" || exit_code=$?
