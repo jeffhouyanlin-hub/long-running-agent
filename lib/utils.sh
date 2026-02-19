@@ -119,7 +119,7 @@ run_claude_session() {
 
     # --- Timeout Configuration ---
     local SESSION_TIMEOUT="${SESSION_TIMEOUT:-3600}"  # 60 min max wall-clock time
-    local IDLE_TIMEOUT="${IDLE_TIMEOUT:-1800}"          # 30 min max with no output (Gradle builds need time)
+    local IDLE_TIMEOUT="${IDLE_TIMEOUT:-3600}"          # 60 min max with no output (Gradle builds need time)
 
     # Activity tracking for idle watchdog
     local activity_file
