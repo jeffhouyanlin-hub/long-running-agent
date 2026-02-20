@@ -355,14 +355,40 @@ while true; do
     fi
     echo ""
 
-    # ── Live Actions ──
-    echo -e "${BOLD}  Actions${NC}"
+    # ── Stream Health + Live Actions ──
     if [[ -f "$LIVE_LOG" && -s "$LIVE_LOG" ]]; then
+        # Stream throughput stats
+        total_events=$(wc -l < "$LIVE_LOG" 2>/dev/null | tr -d ' ')
+        total_events=${total_events:-0}
+        tool_count=$(jq -r 'select(.tools != null and .tools != "") | .tools' "$LIVE_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        tool_count=${tool_count:-0}
+        text_count=$(jq -r 'select(.text != null and .text != "") | .text' "$LIVE_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        text_count=${text_count:-0}
+
+        # Events in last 60 seconds (rough: compare last event ts to now)
+        live_age=$(get_file_age "$LIVE_LOG")
+        if (( live_age < 10 )); then
+            stream_status="${G}● FLOWING${NC}"
+        elif (( live_age < 60 )); then
+            stream_status="${G}● active ${DIM}(${live_age}s ago)${NC}"
+        elif (( live_age < 300 )); then
+            stream_status="${Y}⚠ slow ${DIM}($(fmt_dur "$live_age"))${NC}"
+        else
+            stream_status="${R}✗ stale ${DIM}($(fmt_dur "$live_age"))${NC}"
+        fi
+
+        echo -e "${BOLD}  Stream${NC}  ${stream_status}  ${DIM}events:${NC}${W}${total_events}${NC} ${DIM}tools:${NC}${C}${tool_count}${NC} ${DIM}text:${NC}${B}${text_count}${NC}"
+        echo ""
+
+        # Live Actions (last 12 lines) — includes thinking, text, tools
+        echo -e "${BOLD}  Actions${NC}"
         jq -r '
-            if .tools != null and .tools != "" then
+            if .thinking != null and .thinking != "" then
+                "\(.ts) \u001b[2;35m🧠 \(.thinking[:80])\u001b[0m"
+            elif .tools != null and .tools != "" then
                 "\(.ts) \u001b[1;33m⚡ \(.tools)\u001b[0m"
             elif .text != null and .text != "" then
-                "\(.ts) \u001b[0;34m💬 \(.text[:60])\u001b[0m"
+                "\(.ts) \u001b[0;34m💬 \(.text[:70])\u001b[0m"
             elif .type == "result" then
                 if .is_error == true then
                     "\(.ts) \u001b[0;31m✗ Error (in:\(.input_tokens) out:\(.output_tokens))\u001b[0m"
@@ -370,14 +396,17 @@ while true; do
                     "\(.ts) \u001b[0;32m✓ Done (in:\(.input_tokens) out:\(.output_tokens))\u001b[0m"
                 end
             else empty end
-        ' "$LIVE_LOG" 2>/dev/null | tail -6 | while IFS= read -r line; do
+        ' "$LIVE_LOG" 2>/dev/null | tail -12 | while IFS= read -r line; do
             echo -e "    $line"
         done
     else
+        echo -e "${BOLD}  Stream${NC}  ${DIM}(no live data — starts from next session)${NC}"
+        echo ""
+        echo -e "${BOLD}  Actions${NC}"
         # Fall back to harness output
         if [[ -n "$OUTPUT_FILE" && -f "$OUTPUT_FILE" ]]; then
             tail -15 "$OUTPUT_FILE" 2>/dev/null | \
-                sed 's/\x1b\[[0-9;]*m//g' | grep -v '^$' | tail -6 | \
+                sed 's/\x1b\[[0-9;]*m//g' | grep -v '^$' | tail -8 | \
                 while IFS= read -r line; do echo -e "    ${DIM}${line:0:65}${NC}"; done
         else
             echo -e "    ${DIM}(no data)${NC}"

@@ -263,7 +263,7 @@ run_claude_session() {
             local ts
             ts=$(date '+%H:%M:%S')
 
-            # A2: Single jq call extracts all fields at once
+            # A2: Single jq call extracts all fields at once (including thinking)
             local parsed
             parsed=$(echo "$line" | jq -r '
                 .type as $t |
@@ -274,7 +274,8 @@ run_claude_session() {
                         ([.message.content[]? | select(.type == "tool_use") | .name] | join(",")),
                         (.message.usage.input_tokens // 0 | tostring),
                         (.message.usage.output_tokens // 0 | tostring),
-                        ""
+                        "",
+                        ([.message.content[]? | select(.type == "thinking") | .thinking] | join(" ") | .[0:300])
                     ]
                 elif $t == "result" then
                     [
@@ -283,10 +284,11 @@ run_claude_session() {
                         "",
                         (.usage.input_tokens // 0 | tostring),
                         (.usage.output_tokens // 0 | tostring),
-                        (.is_error // false | tostring)
+                        (.is_error // false | tostring),
+                        ""
                     ]
                 else
-                    [$t, "", "", "0", "0", ""]
+                    [$t, "", "", "0", "0", "", ""]
                 end | @tsv
             ' 2>/dev/null || true)
 
@@ -294,18 +296,21 @@ run_claude_session() {
                 continue
             fi
 
-            local msg_type text tool_names input_tokens output_tokens is_error
-            IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error <<< "$parsed"
+            local msg_type text tool_names input_tokens output_tokens is_error thinking
+            IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error thinking <<< "$parsed"
 
             # A4 (bonus): Write valid JSONL via jq instead of printf
             case "$msg_type" in
                 assistant)
                     jq -n --arg ts "$ts" --arg text "${text:0:150}" \
-                        --arg tools "${tool_names:-}" \
+                        --arg tools "${tool_names:-}" --arg thinking "${thinking:0:300}" \
                         --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
-                        '{ts:$ts,type:"assistant",input_tokens:$in,output_tokens:$out,tools:$tools,text:$text}' \
+                        '{ts:$ts,type:"assistant",input_tokens:$in,output_tokens:$out,tools:$tools,text:$text,thinking:$thinking}' \
                         >> "$session_log"
 
+                    if [[ -n "$thinking" ]]; then
+                        echo -e "${BOLD}[Think]${NC} ${thinking:0:120}"
+                    fi
                     if [[ -n "$text" ]]; then
                         echo -e "${BLUE}[Claude]${NC} ${text:0:200}"
                     fi
