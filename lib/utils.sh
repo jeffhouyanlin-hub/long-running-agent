@@ -82,6 +82,11 @@ EOF
 
 # Run a Claude session with the appropriate flags
 # Usage: run_claude_session <prompt_file> <project_dir> <model> [extra_args...]
+#
+# A1: tmpfile + tail -f (no FIFO backpressure)
+# A2: single jq per line (5→1 fork reduction)
+# A3: process group kill via kill -- -PGID (clean child cleanup)
+#
 run_claude_session() {
     local prompt_file="$1"
     local project_dir="$2"
@@ -118,139 +123,276 @@ run_claude_session() {
     cd "$project_dir"
 
     # --- Timeout Configuration ---
-    local SESSION_TIMEOUT="${SESSION_TIMEOUT:-3600}"  # 60 min max wall-clock time
-    local IDLE_TIMEOUT="${IDLE_TIMEOUT:-3600}"          # 60 min max with no output (Gradle builds need time)
+    local SESSION_TIMEOUT="${SESSION_TIMEOUT:-3600}"   # 60 min max wall-clock time
+    local IDLE_TIMEOUT="${IDLE_TIMEOUT:-3600}"          # 60 min max with no output
 
     # Activity tracking for idle watchdog
     local activity_file
     activity_file=$(mktemp)
     touch "$activity_file"
 
-    # Named pipe so we can decouple Claude from the read loop
-    local fifo
-    fifo=$(mktemp -u)
-    mkfifo "$fifo"
+    # --- A1: tmpfile replaces FIFO (no backpressure) ---
+    local output_tmpfile
+    output_tmpfile=$(mktemp)
+
+    # --- A3: Variables for process group cleanup ---
+    local claude_pid=""
+    local claude_pgid=""
+    local watchdog_pid=""
+    local tail_pid=""
 
     # Trap to clean up on unexpected exit (SIGINT, SIGTERM, ERR)
     _session_cleanup() {
-        kill "$claude_pid" 2>/dev/null || true
-        kill "$watchdog_pid" 2>/dev/null || true
-        wait "$claude_pid" 2>/dev/null || true
-        wait "$watchdog_pid" 2>/dev/null || true
-        rm -f "$fifo" "$activity_file"
+        local _wpid="${watchdog_pid:-}"
+        local _tpid="${tail_pid:-}"
+        local _cpid="${claude_pid:-}"
+        local _cpgid="${claude_pgid:-}"
+
+        # Kill watchdog
+        if [[ -n "$_wpid" ]]; then
+            kill "$_wpid" 2>/dev/null || true
+            wait "$_wpid" 2>/dev/null || true
+        fi
+
+        # Kill tail reader
+        if [[ -n "$_tpid" ]]; then
+            kill "$_tpid" 2>/dev/null || true
+            wait "$_tpid" 2>/dev/null || true
+        fi
+
+        # A3: Kill entire process group (catches gradle/node/etc.)
+        if [[ -n "$_cpgid" ]] && [[ "$_cpgid" != "0" ]]; then
+            kill -TERM -- "-$_cpgid" 2>/dev/null || true
+            sleep 1
+            kill -KILL -- "-$_cpgid" 2>/dev/null || true
+        elif [[ -n "$_cpid" ]]; then
+            kill "$_cpid" 2>/dev/null || true
+        fi
+
+        [[ -n "$_cpid" ]] && wait "$_cpid" 2>/dev/null || true
+
+        rm -f "${output_tmpfile:-}" "${activity_file:-}"
     }
     trap _session_cleanup EXIT
 
-    # Start Claude (no external timeout command needed), output to fifo
-    "${cmd[@]}" > "$fifo" 2>&1 &
-    local claude_pid=$!
+    # --- Real-time session log for monitor ---
+    local session_log="$project_dir/.harness-live.jsonl"
+    : > "$session_log"  # truncate
 
-    # --- Combined Watchdog (Solution A + C) ---
-    # Two kill conditions, checked every 60s:
-    #   1. Hard wall-clock limit (SESSION_TIMEOUT) — prevents runaway sessions
-    #   2. Idle limit (IDLE_TIMEOUT) — kills if no output for too long
+    # --- A1+A3: Start Claude with output to tmpfile, in new process group ---
+    set -m  # enable job control for process groups
+    "${cmd[@]}" > "$output_tmpfile" 2>&1 &
+    claude_pid=$!
+    # Get process group ID (macOS + Linux compatible)
+    claude_pgid=$(ps -o pgid= -p "$claude_pid" 2>/dev/null | tr -d ' ' || echo "")
+    set +m  # restore
+
+    log_info "Claude PID: $claude_pid, PGID: ${claude_pgid:-unknown}"
+
+    # --- Watchdog: checked every 15s (was 60s) ---
     (
         local start_time
         start_time=$(date +%s)
         while kill -0 "$claude_pid" 2>/dev/null; do
-            sleep 60
+            sleep 15
             local now
             now=$(date +%s)
 
             # Check hard wall-clock timeout
             local elapsed=$(( now - start_time ))
             if [[ $elapsed -gt $SESSION_TIMEOUT ]]; then
-                echo -e "${YELLOW}[WARN]${NC} Watchdog: session exceeded ${SESSION_TIMEOUT}s wall-clock limit, killing" >&2
-                kill "$claude_pid" 2>/dev/null || true
+                echo -e "${YELLOW}[WARN]${NC} Watchdog: session exceeded ${SESSION_TIMEOUT}s wall-clock limit, killing PGID=${claude_pgid}" >&2
+                if [[ -n "$claude_pgid" ]] && [[ "$claude_pgid" != "0" ]]; then
+                    kill -TERM -- "-$claude_pgid" 2>/dev/null || true
+                    sleep 1
+                    kill -KILL -- "-$claude_pgid" 2>/dev/null || true
+                else
+                    kill "$claude_pid" 2>/dev/null || true
+                fi
                 break
             fi
 
             # Check idle timeout (no output for IDLE_TIMEOUT seconds)
             if [[ -f "$activity_file" ]]; then
                 local last_mod idle_secs
-                # macOS (BSD stat) then Linux fallback
                 last_mod=$(stat -f %m "$activity_file" 2>/dev/null \
                         || stat -c %Y "$activity_file" 2>/dev/null \
                         || echo 0)
                 idle_secs=$(( now - last_mod ))
                 if [[ $idle_secs -gt $IDLE_TIMEOUT ]]; then
-                    echo -e "${YELLOW}[WARN]${NC} Watchdog: no output for ${idle_secs}s (limit: ${IDLE_TIMEOUT}s), killing session" >&2
-                    kill "$claude_pid" 2>/dev/null || true
+                    echo -e "${YELLOW}[WARN]${NC} Watchdog: no output for ${idle_secs}s (limit: ${IDLE_TIMEOUT}s), killing PGID=${claude_pgid}" >&2
+                    if [[ -n "$claude_pgid" ]] && [[ "$claude_pgid" != "0" ]]; then
+                        kill -TERM -- "-$claude_pgid" 2>/dev/null || true
+                        sleep 1
+                        kill -KILL -- "-$claude_pgid" 2>/dev/null || true
+                    else
+                        kill "$claude_pid" 2>/dev/null || true
+                    fi
                     break
                 fi
             fi
         done
     ) &
-    local watchdog_pid=$!
+    watchdog_pid=$!
 
-    # --- Real-time session log for monitor ---
-    local session_log="$project_dir/.harness-live.jsonl"
-    : > "$session_log"  # truncate
-
-    # --- Parse stream-json output (Solution A) ---
+    # --- A1: Read via tail -f (no backpressure on Claude) ---
     local exit_code=0
-    while IFS= read -r line; do
-        touch "$activity_file"  # record activity for watchdog
-        local msg_type
-        msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null || true)
+    tail -f "$output_tmpfile" &
+    tail_pid=$!
 
-        # Write every event to live log for monitor consumption
-        local ts
-        ts=$(date '+%H:%M:%S')
+    # Parse stream-json from tmpfile: poll until Claude exits
+    local last_pos=0
+    while kill -0 "$claude_pid" 2>/dev/null || [[ $(wc -c < "$output_tmpfile") -gt $last_pos ]]; do
+        local current_size
+        current_size=$(wc -c < "$output_tmpfile")
 
-        case "$msg_type" in
-            assistant)
-                local text tool_names input_tokens output_tokens
-                text=$(echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text' 2>/dev/null || true)
-                tool_names=$(echo "$line" | jq -r '[.message.content[]? | select(.type == "tool_use") | .name] | join(",")' 2>/dev/null || true)
-                input_tokens=$(echo "$line" | jq -r '.message.usage.input_tokens // 0' 2>/dev/null || echo 0)
-                output_tokens=$(echo "$line" | jq -r '.message.usage.output_tokens // 0' 2>/dev/null || echo 0)
+        if [[ $current_size -le $last_pos ]]; then
+            sleep 0.5
+            continue
+        fi
 
-                # Write structured event to live log
-                printf '{"ts":"%s","type":"assistant","input_tokens":%s,"output_tokens":%s,"tools":"%s","text":"%s"}\n' \
-                    "$ts" "$input_tokens" "$output_tokens" "$tool_names" \
-                    "$(echo "${text:0:150}" | sed 's/"/\\"/g' | tr '\n' ' ')" \
-                    >> "$session_log"
+        # Read new lines since last_pos
+        while IFS= read -r line; do
+            touch "$activity_file"  # record activity for watchdog
 
-                if [[ -n "$text" ]]; then
-                    echo -e "${BLUE}[Claude]${NC} ${text:0:200}"
-                fi
-                if [[ -n "$tool_names" ]]; then
-                    echo -e "${YELLOW}[Tool]${NC} $tool_names"
-                fi
-                ;;
-            result)
-                local is_error result_input result_output
-                is_error=$(echo "$line" | jq -r '.is_error // false' 2>/dev/null || echo false)
-                result_input=$(echo "$line" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
-                result_output=$(echo "$line" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+            # A2: Fast-path filter — skip lines without "type"
+            if [[ "$line" != *'"type"'* ]]; then
+                continue
+            fi
 
-                printf '{"ts":"%s","type":"result","is_error":%s,"input_tokens":%s,"output_tokens":%s}\n' \
-                    "$ts" "$is_error" "$result_input" "$result_output" \
-                    >> "$session_log"
+            local ts
+            ts=$(date '+%H:%M:%S')
 
-                if [[ "$is_error" == "true" ]]; then
-                    log_error "Session ended with error"
+            # A2: Single jq call extracts all fields at once
+            local parsed
+            parsed=$(echo "$line" | jq -r '
+                .type as $t |
+                if $t == "assistant" then
+                    [
+                        $t,
+                        ([.message.content[]? | select(.type == "text") | .text] | join(" ") | .[0:200]),
+                        ([.message.content[]? | select(.type == "tool_use") | .name] | join(",")),
+                        (.message.usage.input_tokens // 0 | tostring),
+                        (.message.usage.output_tokens // 0 | tostring),
+                        ""
+                    ]
+                elif $t == "result" then
+                    [
+                        $t,
+                        "",
+                        "",
+                        (.usage.input_tokens // 0 | tostring),
+                        (.usage.output_tokens // 0 | tostring),
+                        (.is_error // false | tostring)
+                    ]
                 else
-                    log_info "Session completed successfully."
-                fi
-                break  # ← Exit immediately after receiving result
-                ;;
-            *)
-                # Log other event types (system, etc.)
-                if [[ -n "$msg_type" ]]; then
-                    printf '{"ts":"%s","type":"%s"}\n' "$ts" "$msg_type" >> "$session_log"
-                fi
-                ;;
-        esac
-    done < "$fifo" || exit_code=$?
+                    [$t, "", "", "0", "0", ""]
+                end | @tsv
+            ' 2>/dev/null || true)
 
-    # Cleanup: kill Claude if still running (expected after break)
-    kill "$claude_pid" 2>/dev/null || true
+            if [[ -z "$parsed" ]]; then
+                continue
+            fi
+
+            local msg_type text tool_names input_tokens output_tokens is_error
+            IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error <<< "$parsed"
+
+            # A4 (bonus): Write valid JSONL via jq instead of printf
+            case "$msg_type" in
+                assistant)
+                    jq -n --arg ts "$ts" --arg text "${text:0:150}" \
+                        --arg tools "${tool_names:-}" \
+                        --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
+                        '{ts:$ts,type:"assistant",input_tokens:$in,output_tokens:$out,tools:$tools,text:$text}' \
+                        >> "$session_log"
+
+                    if [[ -n "$text" ]]; then
+                        echo -e "${BLUE}[Claude]${NC} ${text:0:200}"
+                    fi
+                    if [[ -n "$tool_names" ]]; then
+                        echo -e "${YELLOW}[Tool]${NC} $tool_names"
+                    fi
+                    ;;
+                result)
+                    jq -n --arg ts "$ts" \
+                        --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
+                        --argjson err "${is_error:-false}" \
+                        '{ts:$ts,type:"result",is_error:$err,input_tokens:$in,output_tokens:$out}' \
+                        >> "$session_log"
+
+                    if [[ "$is_error" == "true" ]]; then
+                        log_error "Session ended with error"
+                    else
+                        log_info "Session completed successfully."
+                    fi
+                    # Signal done — Claude should exit shortly
+                    ;;
+                *)
+                    if [[ -n "$msg_type" ]]; then
+                        jq -n --arg ts "$ts" --arg type "$msg_type" \
+                            '{ts:$ts,type:$type}' >> "$session_log"
+                    fi
+                    ;;
+            esac
+        done < <(tail -c +"$((last_pos + 1))" "$output_tmpfile" 2>/dev/null)
+
+        last_pos=$current_size
+        sleep 0.3
+    done
+
+    # Process remaining output after Claude exits
+    local final_size
+    final_size=$(wc -c < "$output_tmpfile")
+    if [[ $final_size -gt $last_pos ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" != *'"type"'* ]]; then continue; fi
+            local ts
+            ts=$(date '+%H:%M:%S')
+            local parsed
+            parsed=$(echo "$line" | jq -r '
+                .type as $t |
+                if $t == "result" then
+                    [$t, "", "", (.usage.input_tokens // 0 | tostring), (.usage.output_tokens // 0 | tostring), (.is_error // false | tostring)]
+                else
+                    [$t, "", "", "0", "0", ""]
+                end | @tsv
+            ' 2>/dev/null || true)
+            if [[ -n "$parsed" ]]; then
+                local msg_type text tool_names input_tokens output_tokens is_error
+                IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error <<< "$parsed"
+                if [[ "$msg_type" == "result" ]]; then
+                    jq -n --arg ts "$ts" \
+                        --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
+                        --argjson err "${is_error:-false}" \
+                        '{ts:$ts,type:"result",is_error:$err,input_tokens:$in,output_tokens:$out}' \
+                        >> "$session_log"
+                    if [[ "$is_error" == "true" ]]; then
+                        log_error "Session ended with error"
+                    else
+                        log_info "Session completed successfully."
+                    fi
+                fi
+            fi
+        done < <(tail -c +"$((last_pos + 1))" "$output_tmpfile" 2>/dev/null)
+    fi
+
+    # --- Cleanup ---
+    # Kill tail reader
+    kill "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+
+    # A3: Kill entire process group
     kill "$watchdog_pid" 2>/dev/null || true
-    wait "$claude_pid" 2>/dev/null || true
     wait "$watchdog_pid" 2>/dev/null || true
-    rm -f "$fifo" "$activity_file"
+    if [[ -n "$claude_pgid" ]] && [[ "$claude_pgid" != "0" ]]; then
+        kill -TERM -- "-$claude_pgid" 2>/dev/null || true
+        sleep 1
+        kill -KILL -- "-$claude_pgid" 2>/dev/null || true
+    else
+        kill "$claude_pid" 2>/dev/null || true
+    fi
+    wait "$claude_pid" 2>/dev/null || true
+    rm -f "$output_tmpfile" "$activity_file"
 
     # Remove the EXIT trap so it doesn't fire again
     trap - EXIT
