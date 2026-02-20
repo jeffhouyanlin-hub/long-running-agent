@@ -299,12 +299,16 @@ run_claude_session() {
             local msg_type text tool_names input_tokens output_tokens is_error thinking
             IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error thinking <<< "$parsed"
 
+            # Sanitize numeric fields for --argjson
+            [[ "${input_tokens:-}" =~ ^[0-9]+$ ]] || input_tokens=0
+            [[ "${output_tokens:-}" =~ ^[0-9]+$ ]] || output_tokens=0
+
             # A4 (bonus): Write valid JSONL via jq instead of printf
             case "$msg_type" in
                 assistant)
                     jq -n --arg ts "$ts" --arg text "${text:0:150}" \
                         --arg tools "${tool_names:-}" --arg thinking "${thinking:0:300}" \
-                        --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
+                        --argjson in "$input_tokens" --argjson out "$output_tokens" \
                         '{ts:$ts,type:"assistant",input_tokens:$in,output_tokens:$out,tools:$tools,text:$text,thinking:$thinking}' \
                         >> "$session_log"
 
@@ -319,9 +323,11 @@ run_claude_session() {
                     fi
                     ;;
                 result)
+                    local safe_err="false"
+                    [[ "${is_error:-}" == "true" ]] && safe_err="true"
                     jq -n --arg ts "$ts" \
-                        --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
-                        --argjson err "${is_error:-false}" \
+                        --argjson in "$input_tokens" --argjson out "$output_tokens" \
+                        --argjson err "$safe_err" \
                         '{ts:$ts,type:"result",is_error:$err,input_tokens:$in,output_tokens:$out}' \
                         >> "$session_log"
 
@@ -365,10 +371,14 @@ run_claude_session() {
             if [[ -n "$parsed" ]]; then
                 local msg_type text tool_names input_tokens output_tokens is_error
                 IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error <<< "$parsed"
+                [[ "${input_tokens:-}" =~ ^[0-9]+$ ]] || input_tokens=0
+                [[ "${output_tokens:-}" =~ ^[0-9]+$ ]] || output_tokens=0
                 if [[ "$msg_type" == "result" ]]; then
+                    local safe_err="false"
+                    [[ "${is_error:-}" == "true" ]] && safe_err="true"
                     jq -n --arg ts "$ts" \
-                        --argjson in "${input_tokens:-0}" --argjson out "${output_tokens:-0}" \
-                        --argjson err "${is_error:-false}" \
+                        --argjson in "$input_tokens" --argjson out "$output_tokens" \
+                        --argjson err "$safe_err" \
                         '{ts:$ts,type:"result",is_error:$err,input_tokens:$in,output_tokens:$out}' \
                         >> "$session_log"
                     if [[ "$is_error" == "true" ]]; then
