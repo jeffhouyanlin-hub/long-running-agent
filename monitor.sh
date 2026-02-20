@@ -30,6 +30,8 @@ FEATURES_FILE="$PROJECT_DIR/features.json"
 HARNESS_LOG="$PROJECT_DIR/harness-log.txt"
 PROGRESS_FILE="$PROJECT_DIR/claude-progress.txt"
 LIVE_LOG="$PROJECT_DIR/.harness-live.jsonl"
+STATE_FILE="$PROJECT_DIR/.harness-state.json"
+TMPFILE_PTR="$PROJECT_DIR/.harness-tmpfile"
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -207,6 +209,73 @@ while true; do
     esac
     echo ""
 
+    # ── Current Activity (C: state file) ──
+    if [[ -f "$STATE_FILE" ]]; then
+        st_age=$(get_file_age "$STATE_FILE")
+        if (( st_age < 120 )); then
+            st_thinking=$(jq -r '.thinking // ""' "$STATE_FILE" 2>/dev/null || true)
+            st_tool=$(jq -r '.tool // ""' "$STATE_FILE" 2>/dev/null || true)
+            st_detail=$(jq -r '.detail // ""' "$STATE_FILE" 2>/dev/null || true)
+            st_result=$(jq -r '.result // ""' "$STATE_FILE" 2>/dev/null || true)
+            st_error=$(jq -r '.error // "false"' "$STATE_FILE" 2>/dev/null || true)
+
+            echo -e "  ${BOLD}Now${NC}  ${DIM}(${st_age}s ago)${NC}"
+            if [[ -n "$st_thinking" && "$st_thinking" != "null" ]]; then
+                echo -e "    ${M}🧠 ${st_thinking:0:75}${NC}"
+            fi
+            if [[ -n "$st_tool" && "$st_tool" != "null" ]]; then
+                if [[ -n "$st_detail" && "$st_detail" != "null" ]]; then
+                    echo -e "    ${Y}⚡ ${st_tool}${NC} ${DIM}${st_detail:0:55}${NC}"
+                else
+                    echo -e "    ${Y}⚡ ${st_tool}${NC}"
+                fi
+            fi
+            if [[ -n "$st_result" && "$st_result" != "null" ]]; then
+                if [[ "$st_error" == "true" ]]; then
+                    echo -e "    ${R}✗ ${st_result:0:70}${NC}"
+                else
+                    echo -e "    ${G}→ ${st_result:0:70}${NC}"
+                fi
+            fi
+            echo ""
+        fi
+    fi
+
+    # ── Raw Stream Tail (B: direct tmpfile) ──
+    if [[ -f "$TMPFILE_PTR" ]]; then
+        raw_tmpfile=$(cat "$TMPFILE_PTR" 2>/dev/null || true)
+        if [[ -n "$raw_tmpfile" && -f "$raw_tmpfile" ]]; then
+            raw_age=$(get_file_age "$raw_tmpfile")
+            raw_lines=$(tail -3 "$raw_tmpfile" 2>/dev/null | \
+                jq -r '
+                    if .type == "assistant" then
+                        ([.message.content[]? | select(.type == "tool_use") |
+                            .name as $n |
+                            if $n == "Bash" then ("$ " + (.input.command // "" | .[0:80]))
+                            elif $n == "Read" then ("📖 " + (.input.file_path // ""))
+                            elif $n == "Edit" then ("✏️  " + (.input.file_path // ""))
+                            elif $n == "Write" then ("📝 " + (.input.file_path // ""))
+                            elif $n == "Grep" then ("🔍 " + (.input.pattern // "") + " in " + (.input.path // "."))
+                            elif $n == "Glob" then ("📂 " + (.input.pattern // ""))
+                            elif $n == "Task" then ("🤖 " + (.input.description // ""))
+                            else $n end
+                        ] | join("\n"))
+                    elif .type == "user" then
+                        ([.message.content[]? | select(.type == "tool_result") |
+                            (.content // "" | tostring | .[0:80])
+                        ] | join("\n") | if . == "" then empty else "  → " + . end)
+                    else empty end
+                ' 2>/dev/null || true)
+            if [[ -n "$raw_lines" ]]; then
+                echo -e "  ${BOLD}Live${NC}  ${DIM}(stream ${raw_age}s ago)${NC}"
+                echo "$raw_lines" | tail -4 | while IFS= read -r rl; do
+                    echo -e "    ${DIM}${rl:0:68}${NC}"
+                done
+                echo ""
+            fi
+        fi
+    fi
+
     # ── Current Feature ──
     if [[ -f "$FEATURES_FILE" ]]; then
         current_feat=$(jq -r '
@@ -361,8 +430,16 @@ while true; do
         jq -r '
             if .thinking != null and .thinking != "" then
                 "\(.ts) \u001b[2;35m🧠 \(.thinking[:80])\u001b[0m"
+            elif .detail != null and .detail != "" then
+                "\(.ts) \u001b[1;33m⚡ \(.detail[:75])\u001b[0m"
             elif .tools != null and .tools != "" then
                 "\(.ts) \u001b[1;33m⚡ \(.tools)\u001b[0m"
+            elif .type == "tool_result" then
+                if .error == "true" then
+                    "\(.ts) \u001b[0;31m✗ \(.result[:60])\u001b[0m"
+                else
+                    "\(.ts) \u001b[2m→ \(.result[:60])\u001b[0m"
+                end
             elif .text != null and .text != "" then
                 "\(.ts) \u001b[0;34m💬 \(.text[:70])\u001b[0m"
             elif .type == "result" then
@@ -372,7 +449,7 @@ while true; do
                     "\(.ts) \u001b[0;32m✓ Done (in:\(.input_tokens) out:\(.output_tokens))\u001b[0m"
                 end
             else empty end
-        ' "$LIVE_LOG" 2>/dev/null | tail -12 | while IFS= read -r line; do
+        ' "$LIVE_LOG" 2>/dev/null | tail -14 | while IFS= read -r line; do
             echo -e "    $line"
         done
     else

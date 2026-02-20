@@ -179,6 +179,24 @@ run_claude_session() {
     local session_log="$project_dir/.harness-live.jsonl"
     : > "$session_log"  # truncate
 
+    # --- C: State file for monitor (overwritten each event) ---
+    local state_file="$project_dir/.harness-state.json"
+    echo '{}' > "$state_file"
+
+    # State tracking
+    local _st_thinking="" _st_tool="" _st_detail="" _st_result="" _st_err="false"
+
+    _write_state() {
+        jq -n \
+            --arg thinking "${_st_thinking:0:500}" \
+            --arg tool "$_st_tool" \
+            --arg detail "${_st_detail:0:200}" \
+            --arg result "${_st_result:0:300}" \
+            --arg error "$_st_err" \
+            '{thinking:$thinking,tool:$tool,detail:$detail,result:$result,error:$error}' \
+            > "${state_file}.tmp" 2>/dev/null && mv "${state_file}.tmp" "$state_file" || true
+    }
+
     # --- A1+A3: Start Claude with output to tmpfile, in new process group ---
     set -m  # enable job control for process groups
     "${cmd[@]}" > "$output_tmpfile" 2>&1 &
@@ -188,6 +206,9 @@ run_claude_session() {
     set +m  # restore
 
     log_info "Claude PID: $claude_pid, PGID: ${claude_pgid:-unknown}"
+
+    # --- B: Write tmpfile path for monitor direct reading ---
+    echo "$output_tmpfile" > "$project_dir/.harness-tmpfile"
 
     # --- Watchdog: checked every 15s (was 60s) ---
     (
@@ -255,7 +276,7 @@ run_claude_session() {
         while IFS= read -r line; do
             touch "$activity_file"  # record activity for watchdog
 
-            # A2: Fast-path filter — skip lines without "type"
+            # Fast-path: skip non-JSON lines
             if [[ "$line" != *'"type"'* ]]; then
                 continue
             fi
@@ -263,7 +284,7 @@ run_claude_session() {
             local ts
             ts=$(date '+%H:%M:%S')
 
-            # A2: Single jq call extracts all fields at once (including thinking)
+            # Single jq: extract ALL fields including tool inputs and tool results
             local parsed
             parsed=$(echo "$line" | jq -r '
                 .type as $t |
@@ -275,51 +296,101 @@ run_claude_session() {
                         (.message.usage.input_tokens // 0 | tostring),
                         (.message.usage.output_tokens // 0 | tostring),
                         "",
-                        ([.message.content[]? | select(.type == "thinking") | .thinking] | join(" ") | .[0:300])
+                        ([.message.content[]? | select(.type == "thinking") | .thinking] | join(" ") | .[0:500]),
+                        ([.message.content[]? | select(.type == "tool_use") |
+                            .name as $n |
+                            if $n == "Bash" then ($n + ": " + (.input.command // "" | .[0:120]))
+                            elif $n == "Read" then ($n + ": " + (.input.file_path // ""))
+                            elif $n == "Edit" then ($n + ": " + (.input.file_path // ""))
+                            elif $n == "Write" then ($n + ": " + (.input.file_path // ""))
+                            elif $n == "Grep" then ($n + ": " + (.input.pattern // "") + " in " + (.input.path // "."))
+                            elif $n == "Glob" then ($n + ": " + (.input.pattern // ""))
+                            else $n
+                            end
+                        ] | join(" | ") | .[0:250]),
+                        ""
+                    ]
+                elif $t == "user" then
+                    [
+                        $t,
+                        ([.message.content[]? | select(.type == "tool_result") |
+                            (.content // "") | tostring | .[0:300]
+                        ] | join("\n") | .[0:400]),
+                        ([.message.content[]? | select(.type == "tool_result") |
+                            if .is_error == true then "true" else "false" end
+                        ] | join(",") | .[0:20]),
+                        "0", "0", "", "", "", ""
                     ]
                 elif $t == "result" then
                     [
-                        $t,
-                        "",
-                        "",
+                        $t, "", "",
                         (.usage.input_tokens // 0 | tostring),
                         (.usage.output_tokens // 0 | tostring),
                         (.is_error // false | tostring),
-                        ""
+                        "", "", ""
                     ]
                 else
-                    [$t, "", "", "0", "0", "", ""]
+                    [$t, "", "", "0", "0", "", "", "", ""]
                 end | @tsv
             ' 2>/dev/null || true)
 
-            if [[ -z "$parsed" ]]; then
-                continue
-            fi
+            if [[ -z "$parsed" ]]; then continue; fi
 
-            local msg_type text tool_names input_tokens output_tokens is_error thinking
-            IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error thinking <<< "$parsed"
+            local msg_type text tool_names input_tokens output_tokens is_error thinking tool_detail result_content
+            IFS=$'\t' read -r msg_type text tool_names input_tokens output_tokens is_error thinking tool_detail result_content <<< "$parsed"
 
-            # Sanitize numeric fields for --argjson
+            # Sanitize numerics
             [[ "${input_tokens:-}" =~ ^[0-9]+$ ]] || input_tokens=0
             [[ "${output_tokens:-}" =~ ^[0-9]+$ ]] || output_tokens=0
 
-            # A4 (bonus): Write valid JSONL via jq instead of printf
             case "$msg_type" in
                 assistant)
+                    # Write rich JSONL entry
                     jq -n --arg ts "$ts" --arg text "${text:0:150}" \
-                        --arg tools "${tool_names:-}" --arg thinking "${thinking:0:300}" \
+                        --arg tools "${tool_names:-}" --arg thinking "${thinking:0:500}" \
+                        --arg detail "${tool_detail:0:250}" \
                         --argjson in "$input_tokens" --argjson out "$output_tokens" \
-                        '{ts:$ts,type:"assistant",input_tokens:$in,output_tokens:$out,tools:$tools,text:$text,thinking:$thinking}' \
+                        '{ts:$ts,type:"assistant",input_tokens:$in,output_tokens:$out,tools:$tools,detail:$detail,text:$text,thinking:$thinking}' \
                         >> "$session_log"
 
+                    # Update state (C)
+                    [[ -n "$thinking" ]] && _st_thinking="$thinking"
+                    [[ -n "$tool_names" ]] && _st_tool="$tool_names"
+                    [[ -n "$tool_detail" ]] && _st_detail="$tool_detail"
+                    _write_state
+
+                    # Console output
                     if [[ -n "$thinking" ]]; then
                         echo -e "${BOLD}[Think]${NC} ${thinking:0:120}"
                     fi
                     if [[ -n "$text" ]]; then
                         echo -e "${BLUE}[Claude]${NC} ${text:0:200}"
                     fi
-                    if [[ -n "$tool_names" ]]; then
+                    if [[ -n "$tool_detail" ]]; then
+                        echo -e "${YELLOW}[Tool]${NC} $tool_detail"
+                    elif [[ -n "$tool_names" ]]; then
                         echo -e "${YELLOW}[Tool]${NC} $tool_names"
+                    fi
+                    ;;
+                user)
+                    # Tool result — write to live log + update state
+                    local result_snippet="${text:0:300}"
+                    local result_err="false"
+                    [[ "${tool_names:-}" == *"true"* ]] && result_err="true"
+
+                    jq -n --arg ts "$ts" --arg result "${result_snippet:0:300}" \
+                        --arg error "$result_err" \
+                        '{ts:$ts,type:"tool_result",result:$result,error:$error}' \
+                        >> "$session_log"
+
+                    # Update state (C)
+                    _st_result="${result_snippet:0:300}"
+                    _st_err="$result_err"
+                    _write_state
+
+                    # Show errors in console
+                    if [[ "$result_err" == "true" ]]; then
+                        echo -e "${RED}[Error]${NC} ${result_snippet:0:100}"
                     fi
                     ;;
                 result)
@@ -336,7 +407,6 @@ run_claude_session() {
                     else
                         log_info "Session completed successfully."
                     fi
-                    # Signal done — Claude should exit shortly
                     ;;
                 *)
                     if [[ -n "$msg_type" ]]; then
